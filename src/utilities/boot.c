@@ -296,7 +296,7 @@ static void boot_resolve_dpad(const mapper_input_s *input, core_reportformat_t *
     *format = k_dpad_formats[idx];
 }
 
-static core_reportformat_t boot_resolve_reportformat(const mapper_input_s *input)
+static core_reportformat_t boot_resolve_reportformat(const mapper_input_s *input, bool *auto_gamecube_usb)
 {
     core_reportformat_t format = CORE_REPORTFORMAT_UNDEFINED;
     bool hover_face_handled = false;
@@ -312,7 +312,20 @@ static core_reportformat_t boot_resolve_reportformat(const mapper_input_s *input
         boot_resolve_face_digital(input, &format);
 
     if (format == CORE_REPORTFORMAT_UNDEFINED)
+    {
+#if defined(HOJA_BOOT_AUTO_GAMECUBE_USB) && HOJA_BOOT_AUTO_GAMECUBE_USB
+        // Opt-in wired boards only. Physical mode holds (including ambiguous
+        // combinations) retain the existing policy; the saved default does
+        // not affect the no-hold automatic path.
+        if (boot_count_pressed(input, k_face_codes, 4) == 0u &&
+            boot_count_pressed(input, k_dpad_codes, 3) == 0u)
+        {
+            *auto_gamecube_usb = true;
+            return CORE_REPORTFORMAT_SLIPPI;
+        }
+#endif
         format = core_reportformat_from_default(gamepad_config->gamepad_default_mode);
+    }
 
     return format;
 }
@@ -452,11 +465,24 @@ static void boot_apply_persisted_memory(boot_info_s *info)
 #endif
 
     if (boot_memory.report_format < (uint8_t)CORE_REPORTFORMAT_MAX)
+    {
         info->reportformat = (core_reportformat_t)boot_memory.report_format;
+        info->auto_gamecube_usb = false;
+    }
 
     info->pairing = boot_memory.gamepad_pair ? true : false;
 
-    if (boot_memory.gamepad_method == (uint8_t)GAMEPAD_METHOD_BLUETOOTH)
+    if (boot_memory.gamepad_method == (uint8_t)GAMEPAD_METHOD_WIRED)
+    {
+        // A detected console requests a wired reboot. Resolve the transport
+        // from the NEW format rather than keeping the previous USB selection.
+        info->transport = GAMEPAD_TRANSPORT_AUTO;
+        info->flags &= ~COREBOOT_FLAG_WLAN;
+        boot_apply_wired_transport_default(info->reportformat, info);
+    }
+    else if (boot_memory.gamepad_method == (uint8_t)GAMEPAD_METHOD_USB)
+        info->transport = GAMEPAD_TRANSPORT_USB;
+    else if (boot_memory.gamepad_method == (uint8_t)GAMEPAD_METHOD_BLUETOOTH)
         info->transport = GAMEPAD_TRANSPORT_BLUETOOTH;
     else if (boot_memory.gamepad_method == (uint8_t)GAMEPAD_METHOD_WLAN)
     {
@@ -587,7 +613,9 @@ void boot_init(void)
 #endif
 
     // 3. Gamepad mode from ABXY / d-pad.
-    _boot_info.reportformat = boot_resolve_reportformat(&input);
+    _boot_info.reportformat = boot_resolve_reportformat(&input, &_boot_info.auto_gamecube_usb);
+    if (_boot_info.auto_gamecube_usb)
+        _boot_info.transport = GAMEPAD_TRANSPORT_USB;
 
     // 4. Pairing enable combo.
     if (boot_combo_pairing(&input))

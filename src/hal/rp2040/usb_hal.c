@@ -19,6 +19,46 @@
 
 #include "hhl_tusb.h"
 
+#if defined(HOJA_BOOT_AUTO_GAMECUBE_USB) && HOJA_BOOT_AUTO_GAMECUBE_USB
+#if !defined(HOJA_TRANSPORT_JOYBUSGC_DRIVER) || (HOJA_TRANSPORT_JOYBUSGC_DRIVER != JOYBUS_GC_DRIVER_HAL)
+#error "GameCube/USB auto boot requires the GameCube Joybus HAL"
+#endif
+#include "hal/joybus_gc_hal.h"
+#include "utilities/boot.h"
+#include "tusb.h"
+
+static bool _usb_gc_probe_active = false;
+
+static void _usb_hal_gc_probe_stop(void)
+{
+    if (_usb_gc_probe_active)
+        joybus_gc_hal_probe_stop();
+    _usb_gc_probe_active = false;
+}
+
+static void _usb_hal_gc_probe_task(void)
+{
+    if (!_usb_gc_probe_active)
+        return;
+
+    // Valid console traffic wins if both paths appear at once. USB locks in
+    // once the host requests descriptors; it need not load a Slippi driver.
+    if (joybus_gc_hal_probe_detected())
+    {
+        boot_memory_s next_boot = {
+            .report_format = CORE_REPORTFORMAT_GAMECUBE,
+            .gamepad_method = GAMEPAD_METHOD_WIRED,
+        };
+        _usb_hal_gc_probe_stop();
+        hhl_tusb_stop();
+        boot_set_memory(&next_boot);
+        sys_hal_reboot();
+    }
+    else if (tud_connected())
+        _usb_hal_gc_probe_stop();
+}
+#endif
+
 // WebUSB landing URL the browser offers when the device is plugged in. Defaults
 // to the HOJA config web app; a board may override it by defining
 // HOJA_WEBUSB_URL in its board_config.h (optional, rarely needed).
@@ -114,6 +154,9 @@ static void _usb_hal_webusb_rx(const uint8_t *data, uint16_t len)
 
 void transport_usb_stop()
 {
+#if defined(HOJA_BOOT_AUTO_GAMECUBE_USB) && HOJA_BOOT_AUTO_GAMECUBE_USB
+    _usb_hal_gc_probe_stop();
+#endif
     _usb_hal_mounted = false;
     hhl_tusb_stop();
 }
@@ -202,12 +245,22 @@ bool transport_usb_init(core_params_s *params)
 
     hhl_tusb_init(&tcfg);
 
-    return hhl_tusb_start();
+    bool started = hhl_tusb_start();
+#if defined(HOJA_BOOT_AUTO_GAMECUBE_USB) && HOJA_BOOT_AUTO_GAMECUBE_USB
+    if (started && boot_get_info()->auto_gamecube_usb &&
+        params->core_report_format == CORE_REPORTFORMAT_SLIPPI)
+        _usb_gc_probe_active = joybus_gc_hal_probe_start();
+#endif
+    return started;
 }
 
 void transport_usb_task(uint64_t timestamp)
 {
     hhl_tusb_task();
+
+#if defined(HOJA_BOOT_AUTO_GAMECUBE_USB) && HOJA_BOOT_AUTO_GAMECUBE_USB
+    _usb_hal_gc_probe_task();
+#endif
 
     if (!_usb_hal_mounted)
     {

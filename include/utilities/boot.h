@@ -17,6 +17,7 @@ typedef struct
     bool                pairing;
     bool                usb_bootloader;       // always false after boot_init returns (USB path reboots)
     bool                baseband_bootloader;    // ESP32 firmware-update mode
+    bool                auto_gamecube_usb;     // listen for GC while starting Slippi USB
 } boot_info_s;
 
 // Persisted across a controlled reboot (e.g. runtime pairing macro).

@@ -53,6 +53,10 @@ uint _gamecube_offset;
 pio_sm_config _gamecube_c;
 
 volatile bool _gc_got_data = false;
+// Unlike _gc_got_data, this excludes unknown commands and incomplete payloads.
+static volatile bool _gc_valid_command = false;
+static bool _gc_probe_pull_up = false;
+static bool _gc_probe_pull_down = false;
 bool _gc_running = false;
 volatile bool _gc_rumble = false;
 bool _gc_brake = false;
@@ -155,6 +159,7 @@ void __time_critical_func(_gamecube_command_handler)()
       while (c--)
         asm("nop");
       _gamecube_send_probe();
+      _gc_valid_command = true;
       _byteCounter = BYTECOUNT_UNKNOWN;
       ret = true;
     }
@@ -165,6 +170,7 @@ void __time_critical_func(_gamecube_command_handler)()
         asm("nop");
       joybus_jump_output(GC_PIO_IN_USE, PIO_SM, _gamecube_offset);
       _gamecube_send_origin();
+      _gc_valid_command = true;
       _byteCounter = BYTECOUNT_UNKNOWN;
       ret = true;
     }
@@ -223,6 +229,7 @@ void __time_critical_func(_gamecube_command_handler)()
           asm("nop");
         joybus_jump_output(GC_PIO_IN_USE, PIO_SM, _gamecube_offset);
         _gamecube_send_poll();
+        _gc_valid_command = true;
         ret = true;
       }
     }
@@ -238,6 +245,7 @@ void __time_critical_func(_gamecube_command_handler)()
           asm("nop");
         joybus_jump_output(GC_PIO_IN_USE, PIO_SM, _gamecube_offset);
         _gamecube_send_origin();
+        _gc_valid_command = true;
         ret = true;
       }
     }
@@ -293,6 +301,17 @@ static void __time_critical_func(_gamecube_isr_handler)(void)
 
 bool _joybus_gc_hal_init()
 {
+  if (_gc_running)
+    return false;
+
+  _gc_got_data = false;
+  _gc_valid_command = false;
+  _gc_drop_frame = false;
+  _byteCounter = BYTECOUNT_UNKNOWN;
+  _workingMode = 0x03;
+  _gc_rumble = false;
+  _gc_brake = false;
+
   _gc_data_pin = hoja_config_get()->joybus.data_pin;
 
   // Grab a PIO block + state machine, preferring one that also fits the
@@ -325,6 +344,75 @@ bool _joybus_gc_hal_init()
   _gc_running = true;
 
   return true;
+}
+
+bool joybus_gc_hal_probe_start(void)
+{
+  if (_gc_running)
+    return false;
+
+  // The console may poll before the real GameCube core starts. Never send
+  // zero-valued stick axes during this brief detection phase.
+  const core_gamecube_report_s neutral = {
+    .buttons_2 = 0x80,
+    .stick_left_x = 0x80,
+    .stick_left_y = 0x80,
+    .stick_right_x = 0x80,
+    .stick_right_y = 0x80,
+  };
+  snapshot_gcinput_write(&_gc_hal_snap, &neutral);
+  uint8_t pin = hoja_config_get()->joybus.data_pin;
+  _gc_probe_pull_up = gpio_is_pulled_up(pin);
+  _gc_probe_pull_down = gpio_is_pulled_down(pin);
+  // An unplugged Joybus pin must remain idle high rather than floating.
+  gpio_pull_up(pin);
+  if (_joybus_gc_hal_init())
+    return true;
+  gpio_set_pulls(pin, _gc_probe_pull_up, _gc_probe_pull_down);
+  return false;
+}
+
+bool joybus_gc_hal_probe_detected(void)
+{
+  // Let the identifying reply finish on the wire before requesting a reboot.
+  // The PIO receive instructions precede joybusout in the program.
+  return _gc_running && _gc_valid_command &&
+         pio_sm_get_pc(_gc_pio, _gc_sm) < _gamecube_offset + joybus_offset_joybusout;
+}
+
+void joybus_gc_hal_probe_stop(void)
+{
+  if (!_gc_running)
+    return;
+
+  irq_set_enabled(_gamecube_irq, false);
+  pio_set_irq0_source_enabled(_gc_pio, pis_interrupt0, false);
+  pio_sm_set_enabled(_gc_pio, _gc_sm, false);
+  if (_gc_eof_active)
+  {
+    pio_set_irq0_source_enabled(_gc_pio, pis_interrupt1, false);
+    pio_sm_set_enabled(_gc_pio, _gc_eof_sm, false);
+    pio_sm_clear_fifos(_gc_pio, _gc_eof_sm);
+    pio_sm_unclaim(_gc_pio, _gc_eof_sm);
+    pio_remove_program(_gc_pio, &joybus_eof_program, _gc_eof_offset);
+  }
+  pio_interrupt_clear(_gc_pio, 0);
+  pio_interrupt_clear(_gc_pio, 1);
+  irq_clear(_gamecube_irq);
+  irq_remove_handler(_gamecube_irq, _gamecube_isr_handler);
+  pio_sm_clear_fifos(_gc_pio, _gc_sm);
+  pio_sm_unclaim(_gc_pio, _gc_sm);
+  pio_remove_program(_gc_pio, &joybus_program, _gamecube_offset);
+
+  // Release the open-drain line, including when stopping mid-response.
+  gpio_init(_gc_data_pin);
+  gpio_set_dir(_gc_data_pin, GPIO_IN);
+  gpio_set_pulls(_gc_data_pin, _gc_probe_pull_up, _gc_probe_pull_down);
+  _gc_pio = NULL;
+  _gc_eof_active = false;
+  _gc_running = false;
+  _gc_valid_command = false;
+  _gc_got_data = false;
 }
 
 core_params_s *_gc_hal_params = NULL;
